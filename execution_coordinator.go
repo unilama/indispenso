@@ -51,24 +51,20 @@ func (ece *ExecutionCoordinatorEntry) Next() {
 	}
 
 	// Iterate
-	server.clientsMux.RLock()
 outer:
-	for _, client := range server.clients {
-		client.mux.RLock()
-		defer client.mux.RUnlock()
-		for _, cmd := range client.DispatchedCmds {
-			if cmd.ConsensusRequestId == ece.Id && cmd.ExecutionIterationId == ece.iteration {
+	for _, cmds := range server.agentService.ListCommands() {
+		for _, cmd := range cmds {
+			if cmd.IsExecution(ece) {
 				if conf.Debug {
-					log.Printf("%s was started in the previous iteration %v", cmd.Id, cmd)
+					log.Printf("%s was started in the previous iteration %v", cmd.GetId(), cmd)
 				}
-				if cmd.State != "finished" {
+				if cmd.State() != "finished" {
 					allFinished = false
 					break outer
 				}
 			}
 		}
 	}
-	server.clientsMux.RUnlock()
 
 	// Done? Do we have any work left?
 	if len(ece.cmds) == 0 {
@@ -136,7 +132,7 @@ outer:
 
 		go func(cmd PendingClientCmd) {
 			// Submit to client
-			log.Printf("Starting cmd %s for consensus request %s", cmd.Cmd.Id, ece.Id)
+			log.Printf("Starting cmd %s for consensus request %s", cmd.Cmd.GetId(), ece.Id)
 
 			c := *cmd.Cmd
 			c.ExecutionIterationId = ece.iteration

@@ -47,7 +47,8 @@ func main() {
 	}()
 
 	if conf.ServerEnabled {
-		server = newServer()
+		agentStore := newAgentStore()
+		server = newServer(agentStore)
 		server.Start()
 
 		// Empty seed? Then go for local

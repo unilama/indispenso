@@ -39,34 +39,6 @@ func (c *Consensus) Get(id string) *ConsensusRequest {
 	return c.Pending[id]
 }
 
-// Delete
-func (c *ConsensusRequest) Delete() bool {
-	// Delete child commands
-	server.clientsMux.RLock()
-	for _, client := range server.clients {
-		client.mux.Lock()
-		for k, cmd := range client.DispatchedCmds {
-			if cmd.ConsensusRequestId == c.Id {
-				delete(client.DispatchedCmds, k)
-			}
-		}
-		client.mux.Unlock()
-	}
-	server.clientsMux.RUnlock()
-
-	// Delete request itself
-	server.consensus.pendingMux.Lock()
-	defer server.consensus.pendingMux.Unlock()
-	delete(server.consensus.Pending, c.Id)
-
-	return true
-}
-
-// Cancel the request
-func (c *ConsensusRequest) Cancel(user *User) bool {
-	audit.Log(user, "Consensus", fmt.Sprintf("Cancel %s", c.Id))
-	return c.Delete()
-}
 func (c *ConsensusRequest) Template() *Template {
 	server.templateStore.templateMux.RLock()
 	template := server.templateStore.Templates[c.TemplateId]
@@ -202,6 +174,14 @@ func (c *Consensus) load() {
 		}
 		c.Pending = v
 	}
+}
+
+func (c *Consensus) Abort(req *ConsensusRequest, user *User) {
+	audit.Log(user, "Consensus", fmt.Sprintf("Cancel %s", req.Id))
+	c.pendingMux.Lock()
+	defer c.pendingMux.Unlock()
+	delete(c.Pending, req.Id)
+	c.save()
 }
 
 func (c *Consensus) AddRequest(templateId string, clientIds []string, user *User, reason string) *ConsensusRequest {

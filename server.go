@@ -29,8 +29,7 @@ import (
 // Server methods (you probably only need one or two in HA failover mode)
 
 type Server struct {
-	clientsMux sync.RWMutex
-	clients    map[string]*RegisteredClient
+	agentService AgentService
 
 	Tags    map[string]bool
 	tagsMux sync.RWMutex
@@ -47,24 +46,15 @@ type Server struct {
 
 // Register client
 func (s *Server) RegisterClient(clientId string, tags []string) {
-	s.clientsMux.RLock()
-	if s.clients[clientId] == nil {
-		s.clientsMux.RUnlock()
 
-		// Write lock
-		s.clientsMux.Lock()
-		s.clients[clientId] = newRegisteredClient(clientId)
-		s.clientsMux.Unlock()
+	agent, _ := s.agentService.Get(clientId)
+	if agent == nil {
+		agent = newRegisteredClient(clientId)
+		s.agentService.Add(agent)
 		log.Printf("Client %s registered with tags %s", clientId, tags)
-	} else {
-		s.clientsMux.RUnlock()
 	}
 
-	// Update client
-	s.clients[clientId].mux.Lock()
-	s.clients[clientId].LastPing = time.Now()
-	s.clients[clientId].Tags = tags
-	s.clients[clientId].mux.Unlock()
+	agent.Update(tags)
 
 	// Update tags
 	s.tagsMux.Lock()
@@ -74,23 +64,17 @@ func (s *Server) RegisterClient(clientId string, tags []string) {
 	s.tagsMux.Unlock()
 }
 
+// TODO consider to remove
 func (s *Server) GetClient(clientId string) *RegisteredClient {
-	s.clientsMux.Lock()
-	defer s.clientsMux.Unlock()
-	return s.clients[clientId]
+	client, _ := s.agentService.Get(clientId)
+
+	//TODO unsafe
+	return client.(*RegisteredClient)
 }
 
 // Scan for old clients
 func (s *Server) CleanupClients() {
-	s.clientsMux.Lock()
-	for k, client := range s.clients {
-		if time.Now().Sub(client.LastPing).Seconds() > float64(CLIENT_PING_INTERVAL*5) {
-			// Disconnect
-			log.Printf("Client %s disconnected", client.ClientId)
-			delete(s.clients, k)
-		}
-	}
-	s.clientsMux.Unlock()
+
 }
 
 // Submit command to registered client using channel notify system
@@ -98,15 +82,15 @@ func (client *RegisteredClient) Submit(cmd *Cmd) {
 	client.mux.Lock()
 
 	// Command in pending list, this will be polled of within milliseconds
-	client.Cmds[cmd.Id] = cmd
+	client.Cmds[cmd.GetId()] = cmd
 
 	// Keep track of command status
-	client.DispatchedCmds[cmd.Id] = cmd
+	client.DispatchedCmds[cmd.GetId()] = cmd
 
 	client.mux.Unlock()
 
 	// Log
-	audit.Log(nil, "Execute", fmt.Sprintf("Command '%s' on client %s with id %s", cmd.Command, client.ClientId, cmd.Id))
+	audit.Log(nil, "Execute", fmt.Sprintf("Command '%s' on client %s with id %s", cmd.Command, client.ClientId, cmd.GetId()))
 
 	// Signal for work
 	client.CmdChan <- true
@@ -128,6 +112,23 @@ type RegisteredClient struct {
 
 	// Channel used to trigger the long poll to fire a command to the client
 	CmdChan chan bool `json:"-"`
+}
+
+func (c *RegisteredClient) Commands() []Command {
+	commands := make([]Command, len(c.DispatchedCmds))
+	i := 0
+
+	c.mux.RLock()
+	defer c.mux.RUnlock()
+	for _, cmd := range c.DispatchedCmds {
+		commands[i] = cmd
+		i++
+	}
+	return commands
+}
+
+func (c *RegisteredClient) Id() string {
+	return c.ClientId
 }
 
 // Get list of dispatched commands
@@ -166,6 +167,25 @@ func (c *RegisteredClient) GetDispatchedCmds() map[string]*Cmd {
 	return newMap
 }
 
+func (c *RegisteredClient) AbortExecution(req *ConsensusRequest) error {
+	c.mux.Lock()
+	for k, cmd := range c.DispatchedCmds {
+		if cmd.ConsensusRequestId == req.Id {
+			delete(c.DispatchedCmds, k)
+		}
+	}
+	c.mux.Unlock()
+	return nil
+}
+
+func (c *RegisteredClient) Update(tags []string) error {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	c.LastPing = time.Now()
+	c.Tags = tags
+	return nil
+}
+
 // Does this register client have this tag?
 func (c *RegisteredClient) HasTag(s string) bool {
 	if c.Tags == nil {
@@ -180,6 +200,10 @@ func (c *RegisteredClient) HasTag(s string) bool {
 		}
 	}
 	return false
+}
+
+func (c *RegisteredClient) IsAlive() bool {
+	return time.Now().Sub(c.LastPing).Seconds() > float64(CLIENT_PING_INTERVAL*5)
 }
 
 // Generate keys
@@ -398,7 +422,7 @@ func (s *Server) Start() bool {
 	go func() {
 		c := time.Tick(1 * time.Minute)
 		for _ = range c {
-			server.CleanupClients()
+			server.agentService.Cleanup()
 		}
 	}()
 
@@ -543,30 +567,31 @@ func GetUser2fa(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 
 func DispatchedCmdQuery(tableStore *data_table.DefaultStore) *data_table.DefaultStore {
 	// Fetch and create
-	server.clientsMux.RLock()
-	for _, client := range server.clients {
-		for _, d := range client.GetDispatchedCmds() {
-			commandTime := time.Unix(d.Created, 0)
+	for clientId, cmds := range server.agentService.ListCommands() {
+		for _, d := range cmds {
+			//TODO unsafe
+			cmd := d.(*Cmd)
+			commandTime := time.Unix(cmd.Created, 0)
 			row := make(map[string]interface{})
 			row["created"] = commandTime.Format("2006-01-02 15:04:05")
 
-			template := server.templateStore.Get(d.TemplateId)
+			template := server.templateStore.Get(cmd.TemplateId)
 			if template != nil {
 				row["template"] = template.Title
 			} else {
 				row["template"] = "-"
 			}
 
-			user := server.userStore.ById(d.RequestUserId)
+			user := server.userStore.ById(cmd.RequestUserId)
 			if user != nil {
 				row["user"] = user.Username
 			} else {
 				row["user"] = "-"
 			}
 
-			row["client"] = client.ClientId
-			row["state"] = d.State
-			row["link"] = fmt.Sprintf("logs?id=%s&client=%s", d.Id, client.ClientId)
+			row["client"] = clientId
+			row["state"] = cmd.State()
+			row["link"] = fmt.Sprintf("logs?id=%s&client=%s", d.GetId(), clientId)
 			rowObj := tableStore.CreateRow(row)
 			if time.Since(commandTime).Hours() > 24 {
 				rowObj.RowClass = "history-old"
@@ -574,7 +599,6 @@ func DispatchedCmdQuery(tableStore *data_table.DefaultStore) *data_table.Default
 			tableStore.AddRow(rowObj)
 		}
 	}
-	server.clientsMux.RUnlock()
 
 	return tableStore
 }
@@ -687,11 +711,12 @@ func DeleteConsensusRequest(w http.ResponseWriter, r *http.Request, ps httproute
 		return
 	}
 
-	// Create request
-	res := req.Cancel(user)
-	server.consensus.save()
+	//remove pending executions
+	err := server.agentService.AbortConsensusExecution(req)
+	//remove itself
+	server.consensus.Abort(req, user)
 
-	jr.Set("cancelled", res)
+	jr.Set("cancelled", err == nil)
 
 	jr.OK()
 	fmt.Fprint(w, jr.ToString(conf.Debug))
@@ -1314,32 +1339,12 @@ func GetClients(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 	}
 
 	clients := make([]RegisteredClient, 0)
-	server.clientsMux.RLock()
-outer:
-	for _, clientPtr := range server.clients {
-		// Excluded? One match is enough to skip this one
-		if len(tagsExclude) > 0 {
-			for _, exclude := range tagsExclude {
-				if clientPtr.HasTag(exclude) {
-					continue outer
-				}
-			}
-		}
+	clientList, _ := server.agentService.List(tagsInclude, tagsExclude)
 
-		// Included? Must have all
-		var match bool = true
-		for _, include := range tagsInclude {
-			if !clientPtr.HasTag(include) {
-				match = false
-				break
-			}
-		}
-		if len(tagsInclude) > 0 && match == false {
-			continue
-		}
-
+	for _, clientPtr := range clientList {
 		// Deref, so we can modify the object without modifying the real one
-		client := *clientPtr
+		//TODO unsafe
+		client := *clientPtr.(*RegisteredClient)
 
 		// Clear out the dispatched commands history (massive logs etc)
 		client.DispatchedCmds = nil
@@ -1348,7 +1353,6 @@ outer:
 		// Add to list
 		clients = append(clients, client)
 	}
-	server.clientsMux.RUnlock()
 
 	jr.Set("clients", clients)
 	jr.OK()
@@ -1614,12 +1618,12 @@ func getIp(r *http.Request) string {
 }
 
 // Create new server
-func newServer() *Server {
+func newServer(as AgentService) *Server {
 	id, _ := uuid.NewV4()
 	return &Server{
-		clients:    make(map[string]*RegisteredClient),
-		Tags:       make(map[string]bool),
-		InstanceId: id.String(),
+		Tags:         make(map[string]bool),
+		InstanceId:   id.String(),
+		agentService: as,
 	}
 }
 

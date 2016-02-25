@@ -82,8 +82,8 @@ func GetHttpCheck(w http.ResponseWriter, r *http.Request, ps httprouter.Params) 
 	case <-done:
 	}
 
-	// Cleanup
-	cr.Delete()
+	//Cleanup
+	server.consensus.Abort(cr, server.httpCheckStore.SystemUser)
 
 	// Print results
 	jr.OK()
